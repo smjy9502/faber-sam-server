@@ -1,7 +1,8 @@
 import base64
 import io
+import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 import cv2
 import numpy as np
@@ -200,6 +201,38 @@ def choose_best_mask(
     return best_index, best_mask, best_score, candidates
 
 
+
+def parse_prompt_points(points_json: Optional[str], width: int, height: int) -> list[tuple[int, int]]:
+    if not points_json:
+        return []
+
+    try:
+        raw_points: Any = json.loads(points_json)
+    except json.JSONDecodeError:
+        return []
+
+    if not isinstance(raw_points, list):
+        return []
+
+    points: list[tuple[int, int]] = []
+
+    for item in raw_points:
+        if not isinstance(item, dict):
+            continue
+
+        try:
+            x = int(round(float(item.get("x"))))
+            y = int(round(float(item.get("y"))))
+        except (TypeError, ValueError):
+            continue
+
+        x = max(0, min(width - 1, x))
+        y = max(0, min(height - 1, y))
+        points.append((x, y))
+
+    return points
+
+
 @app.post("/segment")
 def segment(
     image: UploadFile = File(...),
@@ -209,6 +242,8 @@ def segment(
     box_y1: Optional[float] = Form(None),
     box_x2: Optional[float] = Form(None),
     box_y2: Optional[float] = Form(None),
+    positive_points_json: Optional[str] = Form(None),
+    negative_points_json: Optional[str] = Form(None),
 ):
     """
     Supports two SAM prompt modes.
@@ -219,12 +254,29 @@ def segment(
 
     2) Point prompt, fallback:
        point_x, point_y in original image pixel coordinates.
+
+    3) Refinement prompt:
+       positive_points_json and negative_points_json as JSON arrays:
+       [{"x": 120, "y": 80}, ...]
     """
 
     np_image = read_image(image)
     height, width = np_image.shape[:2]
 
     predictor.set_image(np_image)
+
+    positive_points = parse_prompt_points(positive_points_json, width, height)
+    negative_points = parse_prompt_points(negative_points_json, width, height)
+    has_refinement_points = len(positive_points) + len(negative_points) > 0
+
+    point_coords = None
+    point_labels = None
+
+    if has_refinement_points:
+        all_points = positive_points + negative_points
+        labels = [1] * len(positive_points) + [0] * len(negative_points)
+        point_coords = np.array(all_points, dtype=np.float32)
+        point_labels = np.array(labels, dtype=np.int32)
 
     has_box = all(
         value is not None
@@ -252,46 +304,63 @@ def segment(
 
         masks, scores, logits = predictor.predict(
             box=input_box,
+            point_coords=point_coords,
+            point_labels=point_labels,
             multimask_output=True,
         )
 
         prompt = {
-            "type": "box",
+            "type": "refine" if has_refinement_points else "box",
             "box": {
                 "x1": x1,
                 "y1": y1,
                 "x2": x2,
                 "y2": y2,
             },
+            "positive_points": [{"x": x, "y": y} for x, y in positive_points],
+            "negative_points": [{"x": x, "y": y} for x, y in negative_points],
         }
     else:
-        if point_x is None or point_y is None:
-            return {
-                "ok": False,
-                "error": "point 또는 box 좌표가 필요합니다.",
-                "width": width,
-                "height": height,
+        if has_refinement_points:
+            masks, scores, logits = predictor.predict(
+                point_coords=point_coords,
+                point_labels=point_labels,
+                multimask_output=True,
+            )
+
+            prompt = {
+                "type": "refine",
+                "positive_points": [{"x": x, "y": y} for x, y in positive_points],
+                "negative_points": [{"x": x, "y": y} for x, y in negative_points],
             }
+        else:
+            if point_x is None or point_y is None:
+                return {
+                    "ok": False,
+                    "error": "point, box 또는 보정 point 좌표가 필요합니다.",
+                    "width": width,
+                    "height": height,
+                }
 
-        x = max(0, min(width - 1, int(round(point_x))))
-        y = max(0, min(height - 1, int(round(point_y))))
+            x = max(0, min(width - 1, int(round(point_x))))
+            y = max(0, min(height - 1, int(round(point_y))))
 
-        input_point = np.array([[x, y]])
-        input_label = np.array([1])
+            input_point = np.array([[x, y]])
+            input_label = np.array([1])
 
-        masks, scores, logits = predictor.predict(
-            point_coords=input_point,
-            point_labels=input_label,
-            multimask_output=True,
-        )
+            masks, scores, logits = predictor.predict(
+                point_coords=input_point,
+                point_labels=input_label,
+                multimask_output=True,
+            )
 
-        prompt = {
-            "type": "point",
-            "point": {
-                "x": x,
-                "y": y,
-            },
-        }
+            prompt = {
+                "type": "point",
+                "point": {
+                    "x": x,
+                    "y": y,
+                },
+            }
 
     best_index, best_mask, best_score, candidates = choose_best_mask(
         masks=masks,
