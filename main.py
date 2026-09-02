@@ -11,11 +11,19 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from segment_anything import SamPredictor, sam_model_registry
+from torchvision import transforms
+
+try:
+    from transformers import AutoModelForImageSegmentation
+except ImportError:
+    AutoModelForImageSegmentation = None
 
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "models" / "sam_vit_b_01ec64.pth"
 MODEL_TYPE = "vit_b"
+BIREFNET_MODEL_ID = "ZhengPeng7/BiRefNet"
+BIREFNET_INPUT_SIZE = (1024, 1024)
 
 app = FastAPI(title="FABER SAM Server", version="0.2.0")
 
@@ -47,6 +55,45 @@ sam = sam_model_registry[MODEL_TYPE](checkpoint=str(MODEL_PATH))
 sam.to(device=DEVICE)
 predictor = SamPredictor(sam)
 
+_birefnet_model = None
+_birefnet_device = None
+
+BIREFNET_TRANSFORM = transforms.Compose(
+    [
+        transforms.Resize(BIREFNET_INPUT_SIZE),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            [0.485, 0.456, 0.406],
+            [0.229, 0.224, 0.225],
+        ),
+    ]
+)
+
+
+def get_birefnet_model():
+    global _birefnet_model, _birefnet_device
+
+    if _birefnet_model is not None:
+        return _birefnet_model, _birefnet_device
+
+    if AutoModelForImageSegmentation is None:
+        raise RuntimeError(
+            "BiRefNet 의존성이 설치되지 않았습니다. requirements.txt를 다시 설치해주세요."
+        )
+
+    model = AutoModelForImageSegmentation.from_pretrained(
+        BIREFNET_MODEL_ID,
+        trust_remote_code=True,
+    )
+    model.eval()
+
+    device = DEVICE
+    model.to(device=device)
+
+    _birefnet_model = model
+    _birefnet_device = device
+    return _birefnet_model, _birefnet_device
+
 
 @app.get("/health")
 def health():
@@ -55,6 +102,8 @@ def health():
         "model_type": MODEL_TYPE,
         "device": DEVICE,
         "model_path_exists": MODEL_PATH.exists(),
+        "birefnet_model_id": BIREFNET_MODEL_ID,
+        "birefnet_loaded": _birefnet_model is not None,
     }
 
 
@@ -74,6 +123,78 @@ def encode_mask_png(mask: np.ndarray) -> str:
 
     return base64.b64encode(encoded.tobytes()).decode("utf-8")
 
+
+
+def encode_gray_png(mask_uint8: np.ndarray) -> str:
+    image = Image.fromarray(mask_uint8.astype(np.uint8), mode="L")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def encode_rgba_png(image: Image.Image) -> str:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def run_birefnet(image: Image.Image) -> tuple[np.ndarray, Image.Image]:
+    model, device = get_birefnet_model()
+
+    rgb_image = image.convert("RGB")
+    original_size = rgb_image.size
+    input_tensor = BIREFNET_TRANSFORM(rgb_image).unsqueeze(0).to(device)
+
+    with torch.inference_mode():
+        prediction = model(input_tensor)[-1].sigmoid().detach().cpu()[0].squeeze()
+
+    prediction = prediction.clamp(0, 1)
+    mask_small = (prediction.numpy() * 255.0).astype(np.uint8)
+    mask_image = Image.fromarray(mask_small, mode="L").resize(
+        original_size,
+        Image.Resampling.LANCZOS,
+    )
+    mask_uint8 = np.array(mask_image, dtype=np.uint8)
+
+    cutout = rgb_image.copy()
+    cutout.putalpha(mask_image)
+
+    return mask_uint8, cutout
+
+
+@app.post("/remove-background")
+def remove_background(image: UploadFile = File(...)):
+    image_bytes = image.file.read()
+
+    try:
+        source_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception as error:
+        return {
+            "ok": False,
+            "error": f"이미지를 읽지 못했습니다: {error}",
+        }
+
+    try:
+        mask_uint8, cutout = run_birefnet(source_image)
+    except Exception as error:
+        return {
+            "ok": False,
+            "error": f"BiRefNet 추론에 실패했습니다: {error}",
+        }
+
+    binary_mask = mask_uint8 >= 128
+    bbox = get_mask_bbox(binary_mask)
+
+    return {
+        "ok": True,
+        "engine": "birefnet",
+        "model_id": BIREFNET_MODEL_ID,
+        "width": source_image.width,
+        "height": source_image.height,
+        "bbox": bbox,
+        "mask_png_base64": encode_gray_png(mask_uint8),
+        "cutout_png_base64": encode_rgba_png(cutout),
+    }
 
 def get_mask_bbox(mask: np.ndarray) -> Optional[dict]:
     ys, xs = np.where(mask)
