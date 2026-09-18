@@ -84,6 +84,7 @@ def get_birefnet_model():
     model = AutoModelForImageSegmentation.from_pretrained(
         BIREFNET_MODEL_ID,
         trust_remote_code=True,
+        revision="e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4",
     )
     model.eval()
 
