@@ -10,6 +10,7 @@ import torch
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
+from alpha_preservation import preserve_alpha
 from segment_anything import SamPredictor, sam_model_registry
 from torchvision import transforms
 
@@ -155,10 +156,8 @@ def run_birefnet(image: Image.Image) -> tuple[np.ndarray, Image.Image]:
         original_size,
         Image.Resampling.LANCZOS,
     )
+    mask_image, cutout = preserve_alpha(image, mask_image)
     mask_uint8 = np.array(mask_image, dtype=np.uint8)
-
-    cutout = rgb_image.copy()
-    cutout.putalpha(mask_image)
 
     return mask_uint8, cutout
 
@@ -168,7 +167,7 @@ def remove_background(image: UploadFile = File(...)):
     image_bytes = image.file.read()
 
     try:
-        source_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        source_image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
     except Exception as error:
         return {
             "ok": False,
