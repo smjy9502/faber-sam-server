@@ -1,200 +1,107 @@
-import base64
+"""FABER inference API. Startup loads SAM; imports and tests never load weights."""
 import io
 import json
-from pathlib import Path
-from typing import Optional, Any
+import logging
+import time
+import uuid
+from contextlib import asynccontextmanager
+from typing import Optional
 
-import cv2
 import numpy as np
-import torch
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import UploadFile
+from starlette.exceptions import HTTPException
 from PIL import Image
-from alpha_preservation import preserve_alpha
-from segment_anything import SamPredictor, sam_model_registry
-from torchvision import transforms
 
-try:
-    from transformers import AutoModelForImageSegmentation
-except ImportError:
-    AutoModelForImageSegmentation = None
+from inference_runtime import InferenceRuntime, BIREFNET_MODEL_ID
+from runtime_config import Settings
+from server_safety import PublicError, ResponseBudget, read_image, validate_prompt
+
+logger = logging.getLogger("faber.inference")
 
 
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "models" / "sam_vit_b_01ec64.pth"
-MODEL_TYPE = "vit_b"
-BIREFNET_MODEL_ID = "ZhengPeng7/BiRefNet"
-BIREFNET_INPUT_SIZE = (1024, 1024)
-
-app = FastAPI(title="FABER SAM Server", version="0.2.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def error_response(error):
+    return JSONResponse(error.payload(), status_code=error.status)
 
 
-def get_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
+class RequestBoundary:
+    """Bound the complete body before multipart parsing; log only an explicit allowlist."""
+    def __init__(self, app, settings, runtime):
+        self.app, self.settings, self.runtime = app, settings, runtime
 
-    if torch.backends.mps.is_available():
-        return "mps"
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        request_id = uuid.uuid4().hex
+        started = time.monotonic()
+        state = scope.setdefault("state", {})
+        status, response_started = 500, False
+        path = scope.get("path", "")
+        endpoint = path if path in {"/health", "/ready", "/segment", "/remove-background"} else "other"
 
-    return "cpu"
+        async def tracked_send(message):
+            nonlocal status, response_started
+            if message["type"] == "http.response.start":
+                status, response_started = message["status"], True
+                message["headers"] = list(message.get("headers", [])) + [
+                    (b"x-request-id", request_id.encode()), (b"cache-control", b"no-store")]
+            await send(message)
 
+        try:
+            if scope.get("method") == "POST" and endpoint in {"/segment", "/remove-background"}:
+                lengths = [v for k, v in scope.get("headers", []) if k.lower() == b"content-length"]
+                if lengths:
+                    if len(lengths) != 1 or not lengths[0].isdigit():
+                        raise PublicError("INVALID_REQUEST")
+                    if int(lengths[0]) > self.settings.max_request_bytes:
+                        raise PublicError("REQUEST_TOO_LARGE")
+                body = io.BytesIO()
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        return
+                    chunk = message.get("body", b"")
+                    if body.tell() + len(chunk) > self.settings.max_request_bytes:
+                        raise PublicError("REQUEST_TOO_LARGE")
+                    body.write(chunk)
+                    if not message.get("more_body", False):
+                        break
+                state["request_bytes"] = body.tell()
+                # Release the buffer immediately after the parser receives it.
+                async def bounded_receive():
+                    nonlocal body
+                    if body is not None:
+                        data = body.getvalue()
+                        body.close()
+                        body = None
+                        return {"type": "http.request", "body": data, "more_body": False}
+                    return await receive()
+                await self.app(scope, bounded_receive, tracked_send)
+            else:
+                await self.app(scope, receive, tracked_send)
+        except PublicError as error:
+            state["error_code"] = error.code
+            if not response_started:
+                await error_response(error)(scope, receive, tracked_send)
+        except Exception:
+            state["error_code"] = "INTERNAL_ERROR"
+            if not response_started:
+                await error_response(PublicError("INTERNAL_ERROR"))(scope, receive, tracked_send)
+        finally:
+            record = {"request_id": request_id, "endpoint": endpoint, "status": status,
+                      "latency_ms": round((time.monotonic() - started) * 1000),
+                      "sam_ready": self.runtime.sam_ready, "birefnet_loaded": self.runtime.birefnet_loaded}
+            for key in ("request_bytes", "image_width", "image_height", "image_bytes", "error_code"):
+                if key in state:
+                    record[key] = state[key]
+            # Do not emit routine successful health probes.
+            if endpoint not in {"/health", "/ready"} or status >= 400:
+                log = logger.warning if status >= 400 or "error_code" in state else logger.info
+                log(json.dumps(record, separators=(",", ":")))
 
-DEVICE = get_device()
-
-sam = sam_model_registry[MODEL_TYPE](checkpoint=str(MODEL_PATH))
-sam.to(device=DEVICE)
-predictor = SamPredictor(sam)
-
-_birefnet_model = None
-_birefnet_device = None
-
-BIREFNET_TRANSFORM = transforms.Compose(
-    [
-        transforms.Resize(BIREFNET_INPUT_SIZE),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            [0.485, 0.456, 0.406],
-            [0.229, 0.224, 0.225],
-        ),
-    ]
-)
-
-
-def get_birefnet_model():
-    global _birefnet_model, _birefnet_device
-
-    if _birefnet_model is not None:
-        return _birefnet_model, _birefnet_device
-
-    if AutoModelForImageSegmentation is None:
-        raise RuntimeError(
-            "BiRefNet 의존성이 설치되지 않았습니다. requirements.txt를 다시 설치해주세요."
-        )
-
-    model = AutoModelForImageSegmentation.from_pretrained(
-        BIREFNET_MODEL_ID,
-        trust_remote_code=True,
-        revision="e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4",
-    )
-    model.eval()
-
-    device = DEVICE
-    model.to(device=device)
-
-    _birefnet_model = model
-    _birefnet_device = device
-    return _birefnet_model, _birefnet_device
-
-
-@app.get("/health")
-def health():
-    return {
-        "ok": True,
-        "model_type": MODEL_TYPE,
-        "device": DEVICE,
-        "model_path_exists": MODEL_PATH.exists(),
-        "birefnet_model_id": BIREFNET_MODEL_ID,
-        "birefnet_loaded": _birefnet_model is not None,
-    }
-
-
-def read_image(uploaded_file: UploadFile) -> np.ndarray:
-    image_bytes = uploaded_file.file.read()
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    return np.array(image)
-
-
-def encode_mask_png(mask: np.ndarray) -> str:
-    mask_uint8 = (mask.astype(np.uint8) * 255)
-
-    success, encoded = cv2.imencode(".png", mask_uint8)
-
-    if not success:
-        raise RuntimeError("마스크 PNG 인코딩에 실패했습니다.")
-
-    return base64.b64encode(encoded.tobytes()).decode("utf-8")
-
-
-
-def encode_gray_png(mask_uint8: np.ndarray) -> str:
-    image = Image.fromarray(mask_uint8.astype(np.uint8), mode="L")
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-
-def encode_rgba_png(image: Image.Image) -> str:
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-
-def run_birefnet(image: Image.Image) -> tuple[np.ndarray, Image.Image]:
-    model, device = get_birefnet_model()
-
-    rgb_image = image.convert("RGB")
-    original_size = rgb_image.size
-    input_tensor = BIREFNET_TRANSFORM(rgb_image).unsqueeze(0).to(device)
-
-    with torch.inference_mode():
-        prediction = model(input_tensor)[-1].sigmoid().detach().cpu()[0].squeeze()
-
-    prediction = prediction.clamp(0, 1)
-    mask_small = (prediction.numpy() * 255.0).astype(np.uint8)
-    mask_image = Image.fromarray(mask_small, mode="L").resize(
-        original_size,
-        Image.Resampling.LANCZOS,
-    )
-    mask_image, cutout = preserve_alpha(image, mask_image)
-    mask_uint8 = np.array(mask_image, dtype=np.uint8)
-
-    return mask_uint8, cutout
-
-
-@app.post("/remove-background")
-def remove_background(image: UploadFile = File(...)):
-    image_bytes = image.file.read()
-
-    try:
-        source_image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
-    except Exception as error:
-        return {
-            "ok": False,
-            "error": f"이미지를 읽지 못했습니다: {error}",
-        }
-
-    try:
-        mask_uint8, cutout = run_birefnet(source_image)
-    except Exception as error:
-        return {
-            "ok": False,
-            "error": f"BiRefNet 추론에 실패했습니다: {error}",
-        }
-
-    binary_mask = mask_uint8 >= 128
-    bbox = get_mask_bbox(binary_mask)
-
-    return {
-        "ok": True,
-        "engine": "birefnet",
-        "model_id": BIREFNET_MODEL_ID,
-        "width": source_image.width,
-        "height": source_image.height,
-        "bbox": bbox,
-        "mask_png_base64": encode_gray_png(mask_uint8),
-        "cutout_png_base64": encode_rgba_png(cutout),
-    }
 
 def get_mask_bbox(mask: np.ndarray) -> Optional[dict]:
     ys, xs = np.where(mask)
@@ -323,185 +230,140 @@ def choose_best_mask(
 
 
 
-def parse_prompt_points(points_json: Optional[str], width: int, height: int) -> list[tuple[int, int]]:
-    if not points_json:
-        return []
-
-    try:
-        raw_points: Any = json.loads(points_json)
-    except json.JSONDecodeError:
-        return []
-
-    if not isinstance(raw_points, list):
-        return []
-
-    points: list[tuple[int, int]] = []
-
-    for item in raw_points:
-        if not isinstance(item, dict):
-            continue
-
+def segment_result(source, fields, runtime, settings, budget):
+    width, height = source.size
+    parsed = {}
+    for key in ("point_x", "point_y", "box_x1", "box_y1", "box_x2", "box_y2"):
+        value = fields.get(key)
         try:
-            x = int(round(float(item.get("x"))))
-            y = int(round(float(item.get("y"))))
+            parsed[key] = None if value is None else float(value)
         except (TypeError, ValueError):
-            continue
-
-        x = max(0, min(width - 1, x))
-        y = max(0, min(height - 1, y))
-        points.append((x, y))
-
-    return points
-
-
-@app.post("/segment")
-def segment(
-    image: UploadFile = File(...),
-    point_x: Optional[float] = Form(None),
-    point_y: Optional[float] = Form(None),
-    box_x1: Optional[float] = Form(None),
-    box_y1: Optional[float] = Form(None),
-    box_x2: Optional[float] = Form(None),
-    box_y2: Optional[float] = Form(None),
-    positive_points_json: Optional[str] = Form(None),
-    negative_points_json: Optional[str] = Form(None),
-):
-    """
-    Supports two SAM prompt modes.
-
-    1) Box prompt, recommended for product cutout:
-       box_x1, box_y1, box_x2, box_y2 in original image pixel coordinates.
-       Use this when the user roughly drags around the full object.
-
-    2) Point prompt, fallback:
-       point_x, point_y in original image pixel coordinates.
-
-    3) Refinement prompt:
-       positive_points_json and negative_points_json as JSON arrays:
-       [{"x": 120, "y": 80}, ...]
-    """
-
-    np_image = read_image(image)
-    height, width = np_image.shape[:2]
-
-    predictor.set_image(np_image)
-
-    positive_points = parse_prompt_points(positive_points_json, width, height)
-    negative_points = parse_prompt_points(negative_points_json, width, height)
-    has_refinement_points = len(positive_points) + len(negative_points) > 0
-
-    point_coords = None
-    point_labels = None
-
-    if has_refinement_points:
-        all_points = positive_points + negative_points
-        labels = [1] * len(positive_points) + [0] * len(negative_points)
-        point_coords = np.array(all_points, dtype=np.float32)
-        point_labels = np.array(labels, dtype=np.int32)
-
-    has_box = all(
-        value is not None
-        for value in [box_x1, box_y1, box_x2, box_y2]
-    )
-
-    prompt_box = None
-
-    if has_box:
-        x1 = max(0, min(width - 1, int(round(min(box_x1, box_x2)))))
-        y1 = max(0, min(height - 1, int(round(min(box_y1, box_y2)))))
-        x2 = max(0, min(width - 1, int(round(max(box_x1, box_x2)))))
-        y2 = max(0, min(height - 1, int(round(max(box_y1, box_y2)))))
-
-        if x2 <= x1 or y2 <= y1:
-            return {
-                "ok": False,
-                "error": "유효하지 않은 박스 좌표입니다.",
-                "width": width,
-                "height": height,
-            }
-
-        input_box = np.array([x1, y1, x2, y2])
-        prompt_box = (x1, y1, x2, y2)
-
-        masks, scores, logits = predictor.predict(
-            box=input_box,
-            point_coords=point_coords,
-            point_labels=point_labels,
-            multimask_output=True,
-        )
-
-        prompt = {
-            "type": "refine" if has_refinement_points else "box",
-            "box": {
-                "x1": x1,
-                "y1": y1,
-                "x2": x2,
-                "y2": y2,
-            },
-            "positive_points": [{"x": x, "y": y} for x, y in positive_points],
-            "negative_points": [{"x": x, "y": y} for x, y in negative_points],
-        }
+            raise PublicError("INVALID_PROMPT") from None
+    point, box, positive, negative = validate_prompt(
+        width, height, settings, **parsed,
+        positive_points_json=fields.get("positive_points_json"),
+        negative_points_json=fields.get("negative_points_json"))
+    refined = bool(positive or negative)
+    coordinates = np.array(positive + negative, dtype=np.float32) if refined else None
+    labels = np.array([1] * len(positive) + [0] * len(negative), dtype=np.int32) if refined else None
+    if box is not None or refined:
+        prompt = {"type": "refine" if refined else "box",
+                  "positive_points": [{"x": x, "y": y} for x, y in positive],
+                  "negative_points": [{"x": x, "y": y} for x, y in negative]}
+        if box:
+            prompt["box"] = dict(zip(("x1", "y1", "x2", "y2"), box))
     else:
-        if has_refinement_points:
-            masks, scores, logits = predictor.predict(
-                point_coords=point_coords,
-                point_labels=point_labels,
-                multimask_output=True,
-            )
+        coordinates, labels = np.array([point]), np.array([1])
+        prompt = {"type": "point", "point": {"x": point[0], "y": point[1]}}
+    masks, scores, _ = runtime.segment(np.array(source.convert("RGB")),
+        box=np.array(box) if box else None, point_coords=coordinates,
+        point_labels=labels, multimask_output=True)
+    index, mask, score, candidates = choose_best_mask(masks, scores, width, height, box)
+    return {"ok": True, "width": width, "height": height, "prompt": prompt,
+            "score": score, "bbox": get_mask_bbox(mask), "selected_candidate_index": index,
+            "candidates": candidates, "mask_png_base64": budget.png(Image.fromarray(mask.astype(np.uint8) * 255))}
 
-            prompt = {
-                "type": "refine",
-                "positive_points": [{"x": x, "y": y} for x, y in positive_points],
-                "negative_points": [{"x": x, "y": y} for x, y in negative_points],
-            }
+
+def process_image(file, fields, endpoint, runtime, settings, state):
+    source, size = read_image(file, settings)
+    state.update(image_width=source.width, image_height=source.height, image_bytes=size)
+    budget = ResponseBudget(settings.max_response_bytes)
+    try:
+        if endpoint == "segment":
+            result = segment_result(source, fields, runtime, settings, budget)
         else:
-            if point_x is None or point_y is None:
-                return {
-                    "ok": False,
-                    "error": "point, box 또는 보정 point 좌표가 필요합니다.",
-                    "width": width,
-                    "height": height,
-                }
+            mask, cutout = runtime.remove_background(source)
+            result = {"ok": True, "engine": "birefnet", "model_id": BIREFNET_MODEL_ID,
+                      "width": source.width, "height": source.height,
+                      "bbox": get_mask_bbox(mask >= 128),
+                      "mask_png_base64": budget.png(Image.fromarray(mask.astype(np.uint8))),
+                      "cutout_png_base64": budget.png(cutout)}
+        return Response(budget.render(result), media_type="application/json")
+    except PublicError:
+        raise
+    except Exception:
+        raise PublicError("INFERENCE_FAILED") from None
+    finally:
+        source.close()
 
-            x = max(0, min(width - 1, int(round(point_x))))
-            y = max(0, min(height - 1, int(round(point_y))))
 
-            input_point = np.array([[x, y]])
-            input_label = np.array([1])
+def create_app(settings=None, runtime=None):
+    settings = settings or Settings.from_env()
+    runtime = runtime or InferenceRuntime(settings)
 
-            masks, scores, logits = predictor.predict(
-                point_coords=input_point,
-                point_labels=input_label,
-                multimask_output=True,
-            )
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            await run_in_threadpool(runtime.start)
+        except Exception as error:
+            code = "SAM_CHECKPOINT_MISSING" if isinstance(error, RuntimeError) and str(error) == "SAM_CHECKPOINT_MISSING" else "MODEL_STARTUP_FAILED"
+            logger.error(json.dumps({"event": "startup_failed", "code": code}))
+            raise RuntimeError(code) from None
+        yield
 
-            prompt = {
-                "type": "point",
-                "point": {
-                    "x": x,
-                    "y": y,
-                },
-            }
+    app = FastAPI(title="FABER SAM Server", version="0.3.0", lifespan=lifespan)
+    app.state.runtime = runtime
 
-    best_index, best_mask, best_score, candidates = choose_best_mask(
-        masks=masks,
-        scores=scores,
-        image_width=width,
-        image_height=height,
-        prompt_box=prompt_box,
-    )
+    @app.exception_handler(PublicError)
+    async def public_error(request, error):
+        request.scope.setdefault("state", {})["error_code"] = error.code
+        return error_response(error)
 
-    mask_png_base64 = encode_mask_png(best_mask)
-    bbox = get_mask_bbox(best_mask)
+    @app.exception_handler(HTTPException)
+    async def http_error(request, error):
+        if error.status_code in (404, 405):
+            return JSONResponse({"ok": False, "code": "NOT_FOUND", "error": "지원하지 않는 요청입니다."}, status_code=error.status_code)
+        return await public_error(request, PublicError("INVALID_REQUEST"))
 
-    return {
-        "ok": True,
-        "width": width,
-        "height": height,
-        "prompt": prompt,
-        "score": best_score,
-        "bbox": bbox,
-        "selected_candidate_index": best_index,
-        "candidates": candidates,
-        "mask_png_base64": mask_png_base64,
-    }
+    @app.get("/health")
+    def health():
+        return {"ok": True, "model_type": "vit_b", "device": runtime.device,
+                "model_path_exists": settings.sam_checkpoint.is_file(),
+                "sam_ready": runtime.sam_ready, "birefnet_model_id": BIREFNET_MODEL_ID,
+                "birefnet_loaded": runtime.birefnet_loaded}
+
+    @app.get("/ready")
+    def ready():
+        return JSONResponse({"ok": runtime.sam_ready, "sam_ready": runtime.sam_ready,
+                             "birefnet_loaded": runtime.birefnet_loaded,
+                             "birefnet_strategy": "lazy_offline"},
+                            status_code=200 if runtime.sam_ready else 503)
+
+    async def dispatch(request, endpoint):
+        if not request.headers.get("content-type", "").lower().startswith("multipart/form-data;"):
+            raise PublicError("INVALID_REQUEST")
+        allowed = {"image"}
+        if endpoint == "segment":
+            allowed.update({"point_x", "point_y", "box_x1", "box_y1", "box_x2", "box_y2", "positive_points_json", "negative_points_json"})
+        try:
+            async with request.form(max_files=1, max_fields=8, max_part_size=settings.max_prompt_bytes) as form:
+                if any(key not in allowed or len(form.getlist(key)) != 1 for key in form):
+                    raise PublicError("INVALID_REQUEST")
+                image = form.get("image")
+                if not isinstance(image, UploadFile) or any(isinstance(v, UploadFile) for k, v in form.items() if k != "image"):
+                    raise PublicError("INVALID_REQUEST")
+                return await run_in_threadpool(process_image, image.file,
+                    {k: v for k, v in form.items() if k != "image"}, endpoint, runtime, settings,
+                    request.scope.setdefault("state", {}))
+        except PublicError:
+            raise
+        except HTTPException:
+            raise PublicError("INVALID_REQUEST") from None
+        except Exception:
+            raise PublicError("INVALID_REQUEST") from None
+
+    @app.post("/segment")
+    async def segment(request: Request):
+        return await dispatch(request, "segment")
+
+    @app.post("/remove-background")
+    async def remove_background(request: Request):
+        return await dispatch(request, "remove-background")
+
+    app.add_middleware(RequestBoundary, settings=settings, runtime=runtime)
+    app.add_middleware(CORSMiddleware, allow_origins=list(settings.cors_origins),
+                       allow_credentials=True, allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
+    return app
+
+
+app = create_app()

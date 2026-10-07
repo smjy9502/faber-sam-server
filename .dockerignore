@@ -1,0 +1,10 @@
+# Allowlist: no local weights, fixtures, credentials or caches enter build context.
+**
+!Dockerfile
+!requirements-container.txt
+!main.py
+!alpha_preservation.py
+!runtime_config.py
+!server_safety.py
+!inference_runtime.py
+!run_server.py
