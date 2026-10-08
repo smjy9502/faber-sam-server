@@ -1,0 +1,25 @@
+# P5-B only: build with --platform linux/amd64 from an explicit temporary context.
+# Keep the production/CPU Dockerfile and inference code unchanged.
+FROM python:3.11.14-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN python -m venv /opt/venv
+COPY requirements-container-gpu.txt /tmp/requirements-container-gpu.txt
+RUN /opt/venv/bin/pip install --no-cache-dir --retries 0 -r /tmp/requirements-container-gpu.txt \
+    && /opt/venv/bin/pip check
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
+    PORT=8080 TORCH_THREADS=2 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+    HF_HOME=/tmp/huggingface HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    SAM_CHECKPOINT_PATH=/models/sam_vit_b_01ec64.pth \
+    BIREFNET_MODEL_PATH=/models/birefnet CORS_ORIGINS=""
+RUN groupadd --gid 10001 app && useradd --uid 10001 --gid app --create-home app \
+    && mkdir /app /models && chown app:app /app /models
+WORKDIR /app
+COPY --chown=app:app main.py alpha_preservation.py runtime_config.py server_safety.py inference_runtime.py run_server.py ./
+# Only the approved existing local weights are staged under models/ outside Git.
+COPY --chown=app:app models/ /models/
+USER app
+EXPOSE 8080
+# Fail closed before starting the API if the allocated L4/CUDA device is absent.
+CMD ["python", "-c", "import json,sys,torch; available=torch.cuda.is_available(); name=torch.cuda.get_device_name(0) if available else ''; print(json.dumps({'event':'gpu_benchmark_device','cuda_available':available,'gpu_name':name,'torch':torch.__version__,'cuda_version':torch.version.cuda}),flush=True); sys.exit(2) if not available or 'L4' not in name else None; import run_server; sys.exit(run_server.main())"]
